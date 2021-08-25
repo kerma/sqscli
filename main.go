@@ -3,6 +3,8 @@ package sqs
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -11,6 +13,15 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/aws/aws-sdk-go/service/sqs"
+)
+
+const (
+	attrNumberOfMessages  string = "ApproximateNumberOfMessages"
+	attrNotVisible        string = "ApproximateNumberOfMessagesNotVisible"
+	attrRedrivePolicy     string = "RedrivePolicy"
+	attrQueueArn          string = "QueueArn"
+	attrVisibilityTimeout string = "VisibilityTimeout"
+	dataTypeString        string = "String"
 )
 
 type Sqs struct {
@@ -31,8 +42,9 @@ func (p *redrivePolicy) getNameOrTargetArn(queueArn string) string {
 	return p.TargetArn
 }
 
-type GetOutput struct {
+type QueueInfo struct {
 	QueueName          string
+	QueueUrl           string
 	NumberOfMessages   int
 	MessagesNotVisible int
 	VisibilityTimeout  int
@@ -40,34 +52,7 @@ type GetOutput struct {
 	MaxReceiveCount    int
 }
 
-func NewGetOutput(name string, attr map[string]*string) *GetOutput {
-	out := &GetOutput{
-		QueueName: name,
-	}
-
-	if nom, err := strconv.Atoi(*attr["ApproximateNumberOfMessages"]); err == nil {
-		out.NumberOfMessages = nom
-	}
-	if mnv, err := strconv.Atoi(*attr["ApproximateNumberOfMessagesNotVisible"]); err == nil {
-		out.NumberOfMessages = mnv
-	}
-	if vt, err := strconv.Atoi(*attr["VisibilityTimeout"]); err == nil {
-		out.VisibilityTimeout = vt
-	}
-
-	if p, ok := attr["RedrivePolicy"]; ok {
-		fmt.Println(*p)
-		var policy redrivePolicy
-		if err := json.Unmarshal([]byte(*p), &policy); err == nil {
-			out.DeadLetterTarget = policy.getNameOrTargetArn(*attr["QueueArn"])
-			out.MaxReceiveCount = policy.MaxReceiveCount
-		}
-	}
-
-	return out
-}
-
-func (o *GetOutput) String() string {
+func (o *QueueInfo) String() string {
 	return fmt.Sprintf("%s\t%d\t%d\t%d\t%d\t%s",
 		o.QueueName,
 		o.NumberOfMessages,
@@ -77,10 +62,30 @@ func (o *GetOutput) String() string {
 		o.DeadLetterTarget)
 }
 
-func New(s *session.Session) *Sqs {
-	return &Sqs{
-		client: sqs.New(s),
+func newQueueInfo(name string, attributes map[string]*string) *QueueInfo {
+	out := &QueueInfo{
+		QueueName: name,
 	}
+
+	if nom, err := strconv.Atoi(*attributes[attrNumberOfMessages]); err == nil {
+		out.NumberOfMessages = nom
+	}
+	if mnv, err := strconv.Atoi(*attributes[attrNotVisible]); err == nil {
+		out.MessagesNotVisible = mnv
+	}
+	if vt, err := strconv.Atoi(*attributes[attrVisibilityTimeout]); err == nil {
+		out.VisibilityTimeout = vt
+	}
+
+	if p, ok := attributes[attrRedrivePolicy]; ok {
+		var policy redrivePolicy
+		if err := json.Unmarshal([]byte(*p), &policy); err == nil {
+			out.DeadLetterTarget = policy.getNameOrTargetArn(*attributes[attrQueueArn])
+			out.MaxReceiveCount = policy.MaxReceiveCount
+		}
+	}
+
+	return out
 }
 
 type QueueUrl string
@@ -88,6 +93,12 @@ type QueueUrl string
 func (q *QueueUrl) Name() string {
 	parts := strings.Split(string(*q), "/")
 	return parts[len(parts)-1]
+}
+
+func New(s *session.Session) *Sqs {
+	return &Sqs{
+		client: sqs.New(s),
+	}
 }
 
 func (i *Sqs) List() ([]QueueUrl, error) {
@@ -111,23 +122,37 @@ func (i *Sqs) List() ([]QueueUrl, error) {
 	return urls, nil
 }
 
-func (i *Sqs) Get(queueNames []string) ([]*GetOutput, error) {
-	ch := make(chan *GetOutput)
+func (s *Sqs) GetQueueUrl(name string) (string, error) {
+	out, err := s.client.GetQueueUrl(&sqs.GetQueueUrlInput{
+		QueueName: aws.String(name),
+	})
+	if err != nil {
+		return "", errors.Wrap(err, "GetQueueUrl failed")
+	}
+	return *out.QueueUrl, nil
+
+}
+
+func (i *Sqs) Info(queueNames []string) ([]*QueueInfo, error) {
+	ch := make(chan *QueueInfo)
 	cherr := make(chan error)
 
 	for _, n := range queueNames {
-		go i.get(n, ch, cherr)
+		go i.getInfo(n, ch, cherr)
 	}
 
-	output := make([]*GetOutput, len(queueNames))
+	output := make([]*QueueInfo, len(queueNames))
 	for c, _ := range queueNames {
 		output[c] = <-ch
 	}
+	sort.Slice(output, func(i, j int) bool {
+		return output[i].QueueName < output[j].QueueName
+	})
 	return output, nil
 
 }
 
-func (i *Sqs) get(name string, ch chan<- *GetOutput, cherr chan<- error) {
+func (i *Sqs) getInfo(name string, ch chan<- *QueueInfo, cherr chan<- error) {
 	out, err := i.client.GetQueueUrl(&sqs.GetQueueUrlInput{
 		QueueName: aws.String(name),
 	})
@@ -137,17 +162,178 @@ func (i *Sqs) get(name string, ch chan<- *GetOutput, cherr chan<- error) {
 
 	resp, err := i.client.GetQueueAttributes(&sqs.GetQueueAttributesInput{
 		QueueUrl:       out.QueueUrl,
-		AttributeNames: []*string{aws.String("All")},
+		AttributeNames: []*string{aws.String(sqs.QueueAttributeNameAll)},
 	})
 	if err != nil {
 		cherr <- errors.Wrap(err, "GetQueueAttributes failed")
 	}
 
-	ch <- NewGetOutput(name, resp.Attributes)
+	ch <- newQueueInfo(name, resp.Attributes)
+}
+
+func (i *Sqs) Move(src, dst string, limit int) (int, error) {
+	var (
+		srcUrl string = src
+		dstUrl string = dst
+		err    error
+	)
+	if isUrl(src) == false {
+		srcUrl, err = i.GetQueueUrl(src)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if isUrl(dst) == false {
+		dstUrl, err = i.GetQueueUrl(dst)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return i.move(srcUrl, dstUrl, limit)
+}
+
+func (i *Sqs) move(srcUrl, dstUrl string, limit int) (int, error) {
+	input := &sqs.ReceiveMessageInput{
+		QueueUrl:              aws.String(srcUrl),
+		VisibilityTimeout:     aws.Int64(5),
+		MaxNumberOfMessages:   aws.Int64(10),
+		MessageAttributeNames: []*string{aws.String(sqs.QueueAttributeNameAll)},
+		AttributeNames:        []*string{aws.String(sqs.QueueAttributeNameAll)},
+	}
+
+	processed := 0
+	for {
+		receive, err := i.client.ReceiveMessage(input)
+		if err != nil {
+			return processed, errors.Wrap(err, "ReceiveMessage failed")
+		}
+
+		if len(receive.Messages) == 0 || processed == limit {
+			return processed, nil
+		}
+
+		messages := receive.Messages
+
+		if len(receive.Messages)+processed > limit {
+			messages = receive.Messages[0 : limit-processed]
+		}
+
+		if len(messages) == 0 {
+			return processed, nil
+		}
+
+		send, err := i.client.SendMessageBatch(&sqs.SendMessageBatchInput{
+			QueueUrl: aws.String(dstUrl),
+			Entries:  getEntries(messages),
+		})
+
+		if err != nil {
+			return processed, errors.Wrap(err, "SendMessageBatch failed")
+		}
+
+		if len(send.Failed) > 0 {
+			return processed, fmt.Errorf("failed to send %s messages", len(send.Failed))
+		}
+
+		if len(send.Successful) == len(messages) {
+			del, err := i.client.DeleteMessageBatch(&sqs.DeleteMessageBatchInput{
+				Entries:  getDeleteEntries(messages),
+				QueueUrl: aws.String(srcUrl),
+			})
+
+			if err != nil {
+				return processed, errors.Wrap(err, "DeleteMessageBatch failed")
+			}
+
+			if len(del.Failed) > 0 {
+				return processed, fmt.Errorf("failed to delete %s messages", len(del.Failed))
+			}
+			processed += len(messages)
+		}
+	}
+	return processed, nil
+}
+
+func (s *Sqs) Send(dst, body string, attributes map[string]string) (string, error) {
+	var (
+		dstUrl string = dst
+		err    error
+	)
+	if isUrl(dst) == false {
+		dstUrl, err = s.GetQueueUrl(dst)
+		if err != nil {
+			return "", err
+		}
+	}
+	return s.send(dstUrl, body, attributes)
+}
+
+func (s *Sqs) send(dstUrl, body string, attributes map[string]string) (string, error) {
+	input := &sqs.SendMessageInput{
+		QueueUrl:    aws.String(dstUrl),
+		MessageBody: aws.String(body),
+	}
+	if len(attributes) > 0 {
+		ma := make(map[string]*sqs.MessageAttributeValue, len(attributes))
+		for k, v := range attributes {
+			ma[k] = &sqs.MessageAttributeValue{
+				DataType:    aws.String(dataTypeString),
+				StringValue: aws.String(v),
+			}
+		}
+		input.MessageAttributes = ma
+	}
+	resp, err := s.client.SendMessage(input)
+	if err != nil {
+		return "", errors.Wrap(err, "SendMessage failed")
+	}
+	return *resp.MessageId, nil
+}
+
+func getEntries(messages []*sqs.Message) []*sqs.SendMessageBatchRequestEntry {
+	entries := make([]*sqs.SendMessageBatchRequestEntry, len(messages))
+	for i, message := range messages {
+		re := &sqs.SendMessageBatchRequestEntry{
+			MessageBody:       message.Body,
+			Id:                message.MessageId,
+			MessageAttributes: message.MessageAttributes,
+		}
+
+		if messageGroupId, ok := message.Attributes[sqs.MessageSystemAttributeNameMessageGroupId]; ok {
+			re.MessageGroupId = messageGroupId
+		}
+
+		if messageDeduplicationId, ok := message.Attributes[sqs.MessageSystemAttributeNameMessageDeduplicationId]; ok {
+			re.MessageDeduplicationId = messageDeduplicationId
+		}
+
+		entries[i] = re
+	}
+
+	return entries
+}
+
+func getDeleteEntries(messages []*sqs.Message) []*sqs.DeleteMessageBatchRequestEntry {
+	entries := make([]*sqs.DeleteMessageBatchRequestEntry, len(messages))
+	for i, message := range messages {
+		entries[i] = &sqs.DeleteMessageBatchRequestEntry{
+			ReceiptHandle: message.ReceiptHandle,
+			Id:            message.MessageId,
+		}
+	}
+
+	return entries
 }
 
 // parseArn returns account number, region and queue name for a given arn
 func parseArn(arn string) (string, string, string) {
 	parts := strings.Split(arn, ":")
 	return parts[4], parts[3], parts[5]
+}
+
+func isUrl(s string) bool {
+	if _, err := url.ParseRequestURI(s); err == nil {
+		return true
+	}
+	return false
 }

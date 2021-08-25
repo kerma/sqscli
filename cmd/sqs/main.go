@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	sqs "github.com/kerma/sqscli"
@@ -12,13 +15,11 @@ import (
 )
 
 type Options struct {
-	debug       bool
-	profileName string
+	debug bool
 }
 
 var opts = &Options{
-	debug:       false,
-	profileName: "default",
+	debug: false,
 }
 
 var rootCmd = &cobra.Command{
@@ -28,69 +29,58 @@ var rootCmd = &cobra.Command{
 
 func listCommand(opts *Options) *cobra.Command {
 	var (
+		one  bool
 		urls bool
 	)
+
+	client := sqs.New(session.Must(session.NewSession()))
+
+	simpleList := func() error {
+		list, err := client.List()
+		if err != nil {
+			return err
+		}
+		if len(list) == 0 {
+			fmt.Println("No queues")
+			return nil
+		}
+		for _, url := range list {
+			if urls {
+				fmt.Println(url)
+			} else {
+				fmt.Println(url.Name())
+			}
+		}
+		return nil
+	}
+
 	cmd := &cobra.Command{
-		Use:   "ls",
+		Use:   "ls [flags] [queueNames]",
 		Short: "list queues",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			sess := session.Must(session.NewSession())
-			client := sqs.New(sess)
 
-			results, err := client.List()
-			if err != nil {
-				return err
+			if len(args) == 0 && one {
+				return simpleList()
 			}
-
-			if len(results) == 0 {
-				fmt.Println("No queues")
-				return nil
-			}
-
-			for _, url := range results {
-				if urls {
-					fmt.Println(url)
-				} else {
-					fmt.Println(url.Name())
-				}
-			}
-
-			return nil
-		},
-	}
-	cmd.Flags().BoolVarP(&urls, "urls", "u", false, "list as URLs")
-	return cmd
-}
-
-func getCommand(opts *Options) *cobra.Command {
-	var (
-		all bool
-	)
-	cmd := &cobra.Command{
-		Use:   "get [flags] [queueNames]",
-		Short: "Get queue attributes",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if all == false && len(args) < 1 {
-				return fmt.Errorf("At least one queue name is required")
-			}
-			sess := session.Must(session.NewSession())
-			client := sqs.New(sess)
 
 			var queueNames []string
-			if all == true {
+			if len(args) == 0 {
 				list, err := client.List()
 				if err != nil {
 					return err
 				}
+				if len(list) == 0 {
+					fmt.Println("No queues")
+					return nil
+				}
 				for _, val := range list {
 					queueNames = append(queueNames, val.Name())
 				}
-
 			} else {
 				queueNames = args
 			}
 
-			results, err := client.Get(queueNames)
+			results, err := client.Info(queueNames)
 			if err != nil {
 				return err
 			}
@@ -110,13 +100,91 @@ func getCommand(opts *Options) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVarP(&all, "all", "a", false, "Get attributes for all queues")
+	cmd.Flags().BoolVarP(&one, "one", "1", false, "List queues only. Effective when no queue names provided")
+	cmd.Flags().BoolVarP(&urls, "urls", "u", false, "List as URLs. Effective with -1")
 	return cmd
+}
+
+func moveCommand(opts *Options) *cobra.Command {
+	var (
+		limit int
+	)
+	cmd := &cobra.Command{
+		Use:   "mv [flags] sourceQueue destinationQueue",
+		Short: "Move messages from one queue to another",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			src, dest := args[0], args[1]
+
+			client := sqs.New(session.Must(session.NewSession()))
+
+			attrs, err := client.Info([]string{src})
+			if err != nil {
+				return err
+			}
+
+			if limit > 0 {
+				fmt.Printf("Moving %d out of %d messages, please wait...\n", limit, attrs[0].NumberOfMessages)
+			} else {
+				fmt.Printf("Move %d messages, please wait...\n", attrs[0].NumberOfMessages)
+			}
+
+			moved, err := client.Move(src, dest, limit)
+			fmt.Printf("Moved %d messages\n", moved)
+
+			if err != nil {
+				return err
+			}
+
+			return nil
+		},
+	}
+	cmd.Flags().IntVarP(&limit, "limit", "l", 0, "Limits number of messages moved")
+	return cmd
+}
+
+func sendCommand(opts *Options) *cobra.Command {
+	var (
+		attrs map[string]string
+	)
+	cmd := &cobra.Command{
+		Use:   "send [flags] queue < body.txt",
+		Short: "Send a message to queue",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := sqs.New(session.Must(session.NewSession()))
+			id, err := client.Send(args[0], readFromStdin(), attrs)
+			if err != nil {
+				return err
+			}
+			fmt.Println("Sent message id:", id)
+			return nil
+		},
+	}
+	cmd.Flags().StringToStringVarP(&attrs, "attributes", "a", make(map[string]string, 0), "key=value pair of message attributes")
+	return cmd
+}
+
+func readFromStdin() string {
+	scanner := bufio.NewScanner(os.Stdin)
+	builder := strings.Builder{}
+	for scanner.Scan() {
+		builder.Write(scanner.Bytes())
+	}
+	return builder.String()
+}
+
+func isUrl(s string) bool {
+	if _, err := url.ParseRequestURI(s); err == nil {
+		return true
+	}
+	return false
 }
 
 func init() {
 	rootCmd.AddCommand(listCommand(opts))
-	rootCmd.AddCommand(getCommand(opts))
+	rootCmd.AddCommand(moveCommand(opts))
+	rootCmd.AddCommand(sendCommand(opts))
 }
 
 func main() {

@@ -1,0 +1,15 @@
+# https://taskfile.dev
+
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - go run cmd/sqs/main.go -h
+    sources:
+      - "*.go"
+      - cmd/sqs/*.go
+
+  install:
+    cmds:
+      - go install github.com/kerma/sqscli/cmd/sqs
