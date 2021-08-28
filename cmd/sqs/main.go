@@ -165,6 +165,30 @@ func sendCommand(opts *Options) *cobra.Command {
 	return cmd
 }
 
+func downloadCommand(opts *Options) *cobra.Command {
+	var (
+		del   bool
+		limit int
+	)
+	cmd := &cobra.Command{
+		Use:   "download [flags] queue destinationDir",
+		Short: "Download messages from queue",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := sqs.New(session.Must(session.NewSession()))
+			downloaded, err := client.Download(args[0], args[1], limit, del)
+			fmt.Printf("Downloaded %d messages\n", downloaded)
+			if err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVarP(&del, "delete", "d", false, "Delete the message from the queue")
+	cmd.Flags().IntVarP(&limit, "limit", "l", 1, "Number of messages to download")
+	return cmd
+}
+
 func readFromStdin() string {
 	scanner := bufio.NewScanner(os.Stdin)
 	builder := strings.Builder{}
@@ -182,6 +206,7 @@ func isUrl(s string) bool {
 }
 
 func init() {
+	rootCmd.AddCommand(downloadCommand(opts))
 	rootCmd.AddCommand(listCommand(opts))
 	rootCmd.AddCommand(moveCommand(opts))
 	rootCmd.AddCommand(sendCommand(opts))

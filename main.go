@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -101,14 +103,14 @@ func New(s *session.Session) *Sqs {
 	}
 }
 
-func (i *Sqs) List() ([]QueueUrl, error) {
+func (s *Sqs) List() ([]QueueUrl, error) {
 
 	inp := &sqs.ListQueuesInput{
 		MaxResults:      aws.Int64(1000),
 		QueueNamePrefix: aws.String(""),
 	}
 
-	resp, err := i.client.ListQueues(inp)
+	resp, err := s.client.ListQueues(inp)
 	if err != nil {
 		return nil, errors.Wrap(err, "ListQueues failed")
 	}
@@ -152,15 +154,15 @@ func (i *Sqs) Info(queueNames []string) ([]*QueueInfo, error) {
 
 }
 
-func (i *Sqs) getInfo(name string, ch chan<- *QueueInfo, cherr chan<- error) {
-	out, err := i.client.GetQueueUrl(&sqs.GetQueueUrlInput{
+func (s *Sqs) getInfo(name string, ch chan<- *QueueInfo, cherr chan<- error) {
+	out, err := s.client.GetQueueUrl(&sqs.GetQueueUrlInput{
 		QueueName: aws.String(name),
 	})
 	if err != nil {
 		cherr <- errors.Wrap(err, "GetQueueUrl failed")
 	}
 
-	resp, err := i.client.GetQueueAttributes(&sqs.GetQueueAttributesInput{
+	resp, err := s.client.GetQueueAttributes(&sqs.GetQueueAttributesInput{
 		QueueUrl:       out.QueueUrl,
 		AttributeNames: []*string{aws.String(sqs.QueueAttributeNameAll)},
 	})
@@ -192,7 +194,7 @@ func (i *Sqs) Move(src, dst string, limit int) (int, error) {
 	return i.move(srcUrl, dstUrl, limit)
 }
 
-func (i *Sqs) move(srcUrl, dstUrl string, limit int) (int, error) {
+func (s *Sqs) move(srcUrl, dstUrl string, limit int) (int, error) {
 	input := &sqs.ReceiveMessageInput{
 		QueueUrl:              aws.String(srcUrl),
 		VisibilityTimeout:     aws.Int64(5),
@@ -203,7 +205,7 @@ func (i *Sqs) move(srcUrl, dstUrl string, limit int) (int, error) {
 
 	processed := 0
 	for {
-		receive, err := i.client.ReceiveMessage(input)
+		receive, err := s.client.ReceiveMessage(input)
 		if err != nil {
 			return processed, errors.Wrap(err, "ReceiveMessage failed")
 		}
@@ -222,7 +224,7 @@ func (i *Sqs) move(srcUrl, dstUrl string, limit int) (int, error) {
 			return processed, nil
 		}
 
-		send, err := i.client.SendMessageBatch(&sqs.SendMessageBatchInput{
+		send, err := s.client.SendMessageBatch(&sqs.SendMessageBatchInput{
 			QueueUrl: aws.String(dstUrl),
 			Entries:  getEntries(messages),
 		})
@@ -236,7 +238,7 @@ func (i *Sqs) move(srcUrl, dstUrl string, limit int) (int, error) {
 		}
 
 		if len(send.Successful) == len(messages) {
-			del, err := i.client.DeleteMessageBatch(&sqs.DeleteMessageBatchInput{
+			del, err := s.client.DeleteMessageBatch(&sqs.DeleteMessageBatchInput{
 				Entries:  getDeleteEntries(messages),
 				QueueUrl: aws.String(srcUrl),
 			})
@@ -251,6 +253,83 @@ func (i *Sqs) move(srcUrl, dstUrl string, limit int) (int, error) {
 			processed += len(messages)
 		}
 	}
+	return processed, nil
+}
+
+func (s *Sqs) Download(src, dst string, count int, del bool) (int, error) {
+	var (
+		srcUrl string = src
+		err    error
+	)
+	if isUrl(src) == false {
+		srcUrl, err = s.GetQueueUrl(src)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return s.download(srcUrl, dst, count, del)
+}
+
+func (s *Sqs) download(src, dst string, limit int, del bool) (int, error) {
+	input := &sqs.ReceiveMessageInput{
+		QueueUrl:              aws.String(src),
+		VisibilityTimeout:     aws.Int64(2),
+		MaxNumberOfMessages:   aws.Int64(10),
+		MessageAttributeNames: []*string{aws.String(sqs.QueueAttributeNameAll)},
+		AttributeNames:        []*string{aws.String(sqs.QueueAttributeNameAll)},
+	}
+
+	processed := 0
+	for {
+		receive, err := s.client.ReceiveMessage(input)
+		if err != nil {
+			return processed, errors.Wrap(err, "ReceiveMessage failed")
+		}
+
+		if len(receive.Messages) == 0 || processed == limit {
+			return processed, nil
+		}
+
+		messages := receive.Messages
+
+		if len(receive.Messages)+processed > limit {
+			messages = receive.Messages[0 : limit-processed]
+		}
+
+		if len(messages) == 0 {
+			return processed, nil
+		}
+
+		for _, msg := range messages {
+			fp := path.Join(dst, fmt.Sprintf("%s.json", *msg.MessageId))
+			f, err := os.Create(fp)
+			defer f.Close()
+			if err != nil {
+				return processed, errors.Wrap(err, fmt.Sprintf("Cannot create file: %s", fp))
+			}
+			err = json.NewEncoder(f).Encode(msg)
+			if err != nil {
+				return processed, errors.Wrap(err, "json.Marshal failed")
+			}
+
+		}
+		if del {
+			delBatch, err := s.client.DeleteMessageBatch(&sqs.DeleteMessageBatchInput{
+				Entries:  getDeleteEntries(messages),
+				QueueUrl: aws.String(src),
+			})
+
+			if err != nil {
+				return processed, errors.Wrap(err, "DeleteMessageBatch failed")
+			}
+
+			if len(delBatch.Failed) > 0 {
+				return processed, fmt.Errorf("failed to delete %s messages", len(delBatch.Failed))
+			}
+		}
+		processed += len(messages)
+	}
+
 	return processed, nil
 }
 
